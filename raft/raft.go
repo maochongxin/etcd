@@ -248,6 +248,7 @@ func (r *raft) hardState() pb.HardState {
 	}
 }
 
+// 是否获得了半数以上投票
 func (r *raft) quorum() int { return len(r.prs)/2 + 1 }
 
 func (r *raft) nodes() []uint64 {
@@ -502,10 +503,12 @@ func (r *raft) becomeLeader() {
 
 func (r *raft) campaign() {
 	r.becomeCandidate()
+	// 赢得多数选票
 	if r.quorum() == r.poll(r.id, true) {
 		r.becomeLeader()
 		return
 	}
+	// 给其他节点发送选举请求
 	for id := range r.prs {
 		if id == r.id {
 			continue
@@ -516,6 +519,7 @@ func (r *raft) campaign() {
 	}
 }
 
+// 遍历votes 返回成功获得的投票数
 func (r *raft) poll(id uint64, v bool) (granted int) {
 	if v {
 		r.logger.Infof("%x received vote from %x at term %d", r.id, id, r.Term)
@@ -534,7 +538,7 @@ func (r *raft) poll(id uint64, v bool) (granted int) {
 }
 
 func (r *raft) Step(m pb.Message) error {
-	if m.Type == pb.MsgHup {
+	if m.Type == pb.MsgHup { // local message 成为candidate去发起选举
 		if r.state != StateLeader {
 			r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
 			r.campaign()
@@ -691,6 +695,7 @@ func stepCandidate(r *raft, m pb.Message) {
 	case pb.MsgProp:
 		r.logger.Infof("%x no leader at term %d; dropping proposal", r.id, r.Term)
 		return
+	// 收到AppendEntries/HeartBeat/Snapshot, 表示已经有节点当选leader了
 	case pb.MsgApp:
 		r.becomeFollower(r.Term, m.From)
 		r.handleAppendEntries(m)
@@ -701,10 +706,13 @@ func stepCandidate(r *raft, m pb.Message) {
 		r.becomeFollower(m.Term, m.From)
 		r.handleSnapshot(m)
 	case pb.MsgVote:
+		// candidate只会给自己投票, 拒接其他candidate的选举请求
 		r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] rejected vote from %x [logterm: %d, index: %d] at term %d",
 			r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.From, m.LogTerm, m.Index, r.Term)
 		r.send(pb.Message{To: m.From, Type: pb.MsgVoteResp, Reject: true})
 	case pb.MsgVoteResp:
+		// 这里有个疑问, 哪里保证了这里读取选举结果的时候已经收到了尽可能多的选票了
+		// 看代码是每次收到MsgVoteResp后就会执行到这里
 		gr := r.poll(m.From, !m.Reject)
 		r.logger.Infof("%x [quorum:%d] has received %d votes and %d vote rejections", r.id, r.quorum(), gr, len(r.votes)-gr)
 		switch r.quorum() {
@@ -738,6 +746,7 @@ func stepFollower(r *raft, m pb.Message) {
 		r.electionElapsed = 0
 		r.handleSnapshot(m)
 	case pb.MsgVote:
+		// 如果没有投过票, 或者已经投过票(这个节点投过票挂掉了然后再次收到同一个节点的选举请求)
 		if (r.Vote == None || r.Vote == m.From) && r.raftLog.isUpToDate(m.Index, m.LogTerm) {
 			r.electionElapsed = 0
 			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] voted for %x [logterm: %d, index: %d] at term %d",
